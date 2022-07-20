@@ -1,0 +1,6 @@
+**/*.rs.bk
+.idea/
+target
+Cargo.lock
+speedy-derive/target
+speedy-derive/Cargo.lock
