@@ -339,67 +339,6 @@ impl AllEmbeddingServerClient {
 }
 
 #[inline]
-pub fn sign_to_shard_modulo(sign: u64, replica_size: u64) -> u64 {
-    let sign = farmhash::hash64(&sign.to_le_bytes());
-    sign % replica_size
-}
-
-#[inline]
-pub fn indices_to_hashstack_indices(
-    indices: &mut IDTypeFeatureBatch,
-    config: &EmbeddingConfig,
-) -> () {
-    for feature_batch in indices.batches.iter_mut() {
-        let slot_conf = config.get_slot_by_feature_name(&feature_batch.feature_name);
-        if slot_conf.hash_stack_config.hash_stack_rounds > 0 {
-            let mut hash_stack_indices: Vec<HashMap<u64, Vec<(u16, u16)>>> =
-                vec![HashMap::new(); slot_conf.hash_stack_config.hash_stack_rounds];
-            let mut hashed2index_batch_idx: HashMap<u64, i64> = HashMap::with_capacity(
-                feature_batch.index_batch.len() * slot_conf.hash_stack_config.hash_stack_rounds,
-            );
-            feature_batch.index_batch.iter().enumerate().for_each(
-                |(distinct_tensor_idx, single_sign)| {
-                    let mut hashed_sign = single_sign.sign;
-                    for (round, map) in hash_stack_indices.iter_mut().enumerate() {
-                        hashed_sign = farmhash::hash64(&hashed_sign.to_le_bytes());
-                        let hashed_sign_bucket = hashed_sign.clone()
-                            % slot_conf.hash_stack_config.embedding_size as u64
-                            + (round * slot_conf.hash_stack_config.embedding_size) as u64;
-                        // TODO: to avoid hash conflict, try replace hashed2index_batch_idx to key2list
-                        hashed2index_batch_idx
-                            .insert(hashed_sign_bucket, distinct_tensor_idx as i64);
-                        map.entry(hashed_sign_bucket)
-                            .or_insert_with(|| {
-                                Vec::with_capacity(single_sign.in_which_batch_samples.len())
-                            })
-                            .extend_from_slice(single_sign.in_which_batch_samples.as_slice());
-                    }
-                },
-            );
-            let mut hashed_index_batch: Vec<SingleSignInFeatureBatch> = Vec::with_capacity(
-                hash_stack_indices.first().unwrap().len()
-                    * slot_conf.hash_stack_config.hash_stack_rounds,
-            );
-            for map in hash_stack_indices.into_iter() {
-                for (k, v) in map {
-                    hashed_index_batch.push(SingleSignInFeatureBatch {
-                        sign: k,
-                        in_which_batch_samples: v,
-                    });
-                }
-            }
-            feature_batch.index_batch = hashed_index_batch;
-            feature_batch.hashed2index_batch_idx = hashed2index_batch_idx;
-            feature_batch.sample_num_signs = feature_batch
-                .sample_num_signs
-                .iter()
-                .map(|x| x * slot_conf.hash_stack_config.hash_stack_rounds as u32)
-                .collect();
-        }
-    }
-}
-
-#[inline]
 pub fn indices_add_prefix(indices: &mut IDTypeFeatureBatch, config: &EmbeddingConfig) -> () {
     let feature_spacing = if config.feature_index_prefix_bit > 0 {
         (1u64 << (u64::BITS - config.feature_index_prefix_bit as u32)) - 1
@@ -428,6 +367,13 @@ pub fn indices_add_prefix(indices: &mut IDTypeFeatureBatch, config: &EmbeddingCo
     }
 }
 
+#[inline]
+pub fn sign_to_replica_modulo(sign: u64, replica_size: u64) -> u64 {
+    let sign = farmhash::hash64(&sign.to_le_bytes());
+    sign % replica_size
+}
+
+
 #[derive(Clone)]
 pub struct SignWithConfig {
     sign: u64,
@@ -451,7 +397,7 @@ pub fn lookup_batched_all_slots_preprocess(
     replica_size: u64,
 ) -> Vec<Vec<SignWithConfig>> {
     #[inline]
-    fn indices_to_sharded_indices(
+    fn indices_to_replica_indices(
         indices: &IDTypeFeatureBatch,
         config: &EmbeddingConfig,
         replica_size: u64,
@@ -462,7 +408,7 @@ pub fn lookup_batched_all_slots_preprocess(
         for (feature_idx, feature_batch) in indices.batches.iter().enumerate() {
             let slot_conf = config.get_slot_by_feature_name(&feature_batch.feature_name);
             for (sign_idx, single_sign) in feature_batch.index_batch.iter().enumerate() {
-                let replica_index = sign_to_shard_modulo(single_sign.sign, replica_size);
+                let replica_index = sign_to_replica_modulo(single_sign.sign, replica_size);
                 unsafe {
                     results
                         .get_unchecked_mut(replica_index as usize)
@@ -478,9 +424,8 @@ pub fn lookup_batched_all_slots_preprocess(
         results
     }
 
-    indices_to_hashstack_indices(indices, config);
     indices_add_prefix(indices, config);
-    indices_to_sharded_indices(&indices, config, replica_size)
+    indices_to_replica_indices(&indices, config, replica_size)
 }
 
 pub fn lookup_batched_all_slots_postprocess<'a>(
@@ -502,11 +447,7 @@ pub fn lookup_batched_all_slots_postprocess<'a>(
             let (feature_len, sign2idx) = if slot_conf.embedding_summation {
                 (x.batch_size as usize, HashMap::new())
             } else {
-                let distinct_id_size = if slot_conf.hash_stack_config.hash_stack_rounds > 0 {
-                    x.index_batch.len() / slot_conf.hash_stack_config.hash_stack_rounds
-                } else {
-                    x.index_batch.len()
-                };
+                let distinct_id_size = x.index_batch.len();
                 (distinct_id_size + 1, x.hashed2index_batch_idx.clone())
             };
             LookupResultWithSlotConfig {
@@ -583,13 +524,6 @@ pub fn lookup_batched_all_slots_postprocess<'a>(
                     embeddings: ndarray_f32_to_f16(&x.result),
                 })
             } else {
-                if x.config.sqrt_scaling && x.config.hash_stack_config.hash_stack_rounds > 1 {
-                    x.result.mul_assign(
-                        (x.config.hash_stack_config.hash_stack_rounds as f32)
-                            .sqrt()
-                            .recip(),
-                    )
-                }
                 // transform distinct_id tensor to origin batch format
                 let mut index: Vec<i64> =
                     vec![0; indices.batch_size as usize * x.config.sample_fixed_size];
@@ -765,14 +699,6 @@ impl EmbeddingWorkerInner {
                                 f32_gradients.mul_assign(
                                     &sample_num_ids.mapv(|x| (x as f32).sqrt().recip()),
                                 );
-                            } else {
-                                if slot_conf.hash_stack_config.hash_stack_rounds > 0 {
-                                    f32_gradients.mul_assign(
-                                        (slot_conf.hash_stack_config.hash_stack_rounds as f32)
-                                            .sqrt()
-                                            .recip(),
-                                    );
-                                }
                             }
                         });
                     }
@@ -814,7 +740,7 @@ impl EmbeddingWorkerInner {
                             .axis_iter(ndarray::Axis(0))
                             .zip(feature_batch.index_batch.iter())
                         {
-                            let replica_index = sign_to_shard_modulo(sign.sign, self.replica_size);
+                            let replica_index = sign_to_replica_modulo(sign.sign, self.replica_size);
                             sharded_gradients[replica_index as usize]
                                 .extend_from_slice(grad.as_slice().unwrap());
                             sharded_gradient_signs[replica_index as usize].push(sign.sign);
@@ -964,8 +890,8 @@ impl EmbeddingWorkerInner {
         let futs: Vec<_> = tokio::task::block_in_place(|| {
             let grouped_entries = req
                 .into_iter()
-                .sorted_by_key(|e| sign_to_shard_modulo(e.sign(), replica_size))
-                .group_by(|e| sign_to_shard_modulo(e.sign(), replica_size));
+                .sorted_by_key(|e| sign_to_replica_modulo(e.sign(), replica_size))
+                .group_by(|e| sign_to_replica_modulo(e.sign(), replica_size));
 
             grouped_entries
                 .into_iter()
@@ -1566,51 +1492,6 @@ mod lookup_batched_all_slots_preprocess_tests {
     use super::*;
     use persia_common::FeatureBatch;
     use persia_libs::serde_yaml;
-
-    #[test]
-    fn test_indices_to_hashstack_indices() {
-        let config = "feature_index_prefix_bit: 12\nslots_config:\n  Test:\n    dim: 32\n    hash_stack_config:\n      hash_stack_rounds: 2\n      embedding_size: 10\nfeature_groups: {}\n";
-
-        let config: EmbeddingConfig = serde_yaml::from_str(config).expect("failed to parse config");
-
-        let raw_batch: Vec<Vec<u64>> = vec![vec![12, 23, 34], vec![56, 78, 90], vec![12, 56]];
-        let feature_name = "Test".to_string();
-        let feature_batch = FeatureBatch::new(feature_name.clone(), raw_batch);
-        let mut id_type_feature_batch = IDTypeFeatureBatch {
-            requires_grad: false,
-            batches: vec![feature_batch],
-            enter_forward_id_buffer_time: None,
-            enter_post_forward_buffer_time: None,
-            batcher_idx: None,
-        };
-        indices_to_hashstack_indices(&mut id_type_feature_batch, &config);
-        let hashstack_feature_batch = id_type_feature_batch.batches.first().unwrap();
-
-        let target_raw_batch: Vec<Vec<u64>> = vec![
-            vec![2, 18, 5, 10, 0, 11],
-            vec![6, 17, 7, 12, 8, 16],
-            vec![2, 18, 6, 17],
-        ];
-        let target_feature_batch = FeatureBatch::new(feature_name, target_raw_batch);
-
-        for single_sign in hashstack_feature_batch.index_batch.iter() {
-            for target_single_sign in target_feature_batch.index_batch.iter() {
-                if single_sign.sign == target_single_sign.sign {
-                    let mut result = single_sign.in_which_batch_samples.clone();
-                    let mut target = target_single_sign.in_which_batch_samples.clone();
-                    assert_eq!(result.len(), target.len());
-                    result.sort();
-                    target.sort();
-                    let matching = result
-                        .iter()
-                        .zip(&target)
-                        .filter(|&((r, _), (t, _))| r == t)
-                        .count();
-                    assert_eq!(matching, target.len());
-                }
-            }
-        }
-    }
 
     #[test]
     fn test_indices_add_prefix() {
