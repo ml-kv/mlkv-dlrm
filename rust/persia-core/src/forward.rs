@@ -857,6 +857,14 @@ impl Forward {
         self.inner.shutdown()
     }
 
+    pub fn get_available_permits(&self) -> usize {
+        let available_permits = match &self.inner.embedding_staleness_semaphore {
+            Some(s) => s.available_permits(),
+            None => panic!("bounded staleness is not enabled!"),
+        };
+        available_permits
+    }
+
     pub fn get_batch(&self, timeout_ms: u64, py: Python) -> PyResult<PersiaTrainingBatch> {
         let start_time = std::time::Instant::now();
         let receiver = self.inner.gpu_forwarded_channel_r.clone();
