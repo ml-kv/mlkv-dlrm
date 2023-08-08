@@ -1,20 +1,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use snafu::ResultExt;
 
 use persia_libs::{
     bytes, bytes::Bytes, hyper, lz4, once_cell, rand, rand::Rng, thiserror, tokio, tracing,
+    rand::prelude::SmallRng, ndarray::Array1, ndarray_rand::RandomExt, ndarray_rand::rand::SeedableRng,
+    ndarray_rand::rand_distr::{Gamma, Normal, Poisson, Uniform},
 };
-use snafu::ResultExt;
-
 use persia_common::optim::{Optimizable, Optimizer, OptimizerConfig};
 use persia_embedding_config::{
-    EmbeddingConfig, EmbeddingParameterServerConfig, InstanceInfo, PerisaJobType,
-    PersiaCommonConfig, PersiaEmbeddingModelHyperparameters, PersiaGlobalConfigError,
+    EmbeddingConfig, EmbeddingParameterServerConfig, InitializationMethod, InstanceInfo,
+    PerisaJobType, PersiaCommonConfig, PersiaEmbeddingModelHyperparameters, PersiaGlobalConfigError,
     PersiaReplicaInfo,
 };
-use persia_embedding_holder::{emb_entry::HashMapEmbeddingEntry, PersiaEmbeddingHolder};
 use persia_incremental_update_manager::PerisaIncrementalUpdateManager;
-
 use persia_metrics::{Gauge, IntCounter, PersiaMetricsManager, PersiaMetricsManagerError};
 use persia_model_manager::{
     EmbeddingModelManager, EmbeddingModelManagerError, EmbeddingModelManagerStatus,
@@ -101,7 +100,6 @@ pub enum EmbeddingParameterServerError {
 }
 
 pub struct EmbeddingParameterServiceInner {
-    pub embedding: PersiaEmbeddingHolder,
     pub optimizer: persia_libs::async_lock::RwLock<Option<Arc<Box<dyn Optimizable + Send + Sync>>>>,
     pub hyperparameter_config:
         persia_libs::async_lock::RwLock<Option<Arc<PersiaEmbeddingModelHyperparameters>>>,
@@ -112,20 +110,20 @@ pub struct EmbeddingParameterServiceInner {
     pub inc_update_manager: Arc<PerisaIncrementalUpdateManager>,
     pub embedding_model_manager: Arc<EmbeddingModelManager>,
     pub replica_index: usize,
+    pub store: Arc<mlkv_rust::FasterKv>,
 }
 
 impl EmbeddingParameterServiceInner {
     pub fn new(
-        embedding: PersiaEmbeddingHolder,
         server_config: Arc<EmbeddingParameterServerConfig>,
         common_config: Arc<PersiaCommonConfig>,
         embedding_config: Arc<EmbeddingConfig>,
         inc_update_manager: Arc<PerisaIncrementalUpdateManager>,
         embedding_model_manager: Arc<EmbeddingModelManager>,
         replica_index: usize,
+        store: Arc<mlkv_rust::FasterKv>,
     ) -> Self {
         Self {
-            embedding,
             optimizer: persia_libs::async_lock::RwLock::new(None),
             hyperparameter_config: persia_libs::async_lock::RwLock::new(None),
             hyperparameter_configured: persia_libs::async_lock::Mutex::new(false),
@@ -135,6 +133,7 @@ impl EmbeddingParameterServiceInner {
             inc_update_manager,
             embedding_model_manager,
             replica_index,
+            store,
         }
     }
 
@@ -159,6 +158,42 @@ impl EmbeddingParameterServiceInner {
         }
     }
 
+    fn init_embedding_entry(
+        initialization_method: &InitializationMethod,
+        dim: usize,
+        require_space: usize,
+        seed: u64,
+    ) -> Vec<f32> {
+        let emb = {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            match initialization_method {
+                InitializationMethod::BoundedUniform(x) => {
+                    Array1::random_using((dim,), Uniform::new(x.lower, x.upper), &mut rng)
+                }
+                InitializationMethod::BoundedGamma(x) => {
+                    Array1::random_using((dim,), Gamma::new(x.shape, x.scale).unwrap(), &mut rng)
+                }
+                InitializationMethod::BoundedPoisson(x) => {
+                    Array1::random_using((dim,), Poisson::new(x.lambda).unwrap(), &mut rng)
+                }
+                InitializationMethod::BoundedNormal(x) => Array1::random_using(
+                    (dim,),
+                    Normal::new(x.mean, x.standard_deviation).unwrap(),
+                    &mut rng,
+                ),
+                _ => panic!(
+                    "unsupported initialization method for hashmap impl: {:?}",
+                    initialization_method
+                ),
+            }
+        };
+        let mut entry = emb.into_raw_vec();
+        if require_space > 0 {
+            entry.resize(entry.len() + require_space, 0.0_f32);
+        }
+        return entry;
+    }
+
     pub async fn batched_lookup(
         &self,
         req: Vec<(u64, usize)>,
@@ -176,79 +211,74 @@ impl EmbeddingParameterServiceInner {
 
         let optimizer = self.optimizer.read().await;
 
-        tokio::task::block_in_place(|| match is_training {
-            true => {
-                if optimizer.is_none() {
-                    return Err(EmbeddingParameterServerError::OptimizerNotFoundError);
-                }
-                let optimizer = optimizer.as_ref().unwrap();
+        tokio::task::block_in_place(|| {
+            if optimizer.is_none() {
+                return Err(EmbeddingParameterServerError::OptimizerNotFoundError);
+            }
+            let optimizer = optimizer.as_ref().unwrap();
 
-                req.iter().for_each(|(sign, dim)| {
+            match is_training {
+                true => {
+                    self.store.start_session();
+                    req.iter().for_each(|(sign, dim)| {
                         let conf = conf.as_ref().unwrap();
-                        let mut shard = self.embedding.shard(sign).write();
-                        let e = shard.get_refresh(&sign);
-                        match e {
-                            None => {
-                                if rand::thread_rng().gen_range(0f32..1f32) < conf.admit_probability {
-                                    let mut emb_entry = HashMapEmbeddingEntry::new(
-                                        &conf.initialization_method,
-                                        *dim,
-                                        optimizer.require_space(*dim),
-                                        *sign,
-                                        *sign,
-                                    );
+                        let require_space = optimizer.require_space(*dim);
+                        let value = vec![0 as f32; *dim + require_space];
+                        let mut value = std::mem::ManuallyDrop::new(value);
+                        //let read_status = self.store.read(*sign, value.as_mut_ptr() as *mut u8);
+                        //let read_status = self.store.mlkv_lookahead(*sign, value.as_mut_ptr() as *mut u8,
+                        let read_status = self.store.mlkv_read(*sign, value.as_mut_ptr() as *mut u8,
+                           (std::mem::size_of::<f32>() * (*dim + require_space)) as u64);
+                        if read_status == mlkv_rust::faster_status::FasterStatus::NotFound as u8 {
+                            if rand::thread_rng().gen_range(0f32..1f32) < conf.admit_probability {
+                                let mut emb_entry = Self::init_embedding_entry(
+                                    &conf.initialization_method,
+                                    *dim,
+                                    require_space,
+                                    *sign,
+                                );
 
-                                    optimizer.state_initialization(emb_entry.as_mut_emb_entry_slice(), *dim);
-                                    embeddings.extend_from_slice(&emb_entry.as_emb_entry_slice()[..*dim]);
-                                    let _ = shard.insert(*sign, emb_entry);
+                                optimizer.state_initialization(emb_entry.as_mut_slice(), *dim);
+                                embeddings.extend_from_slice(&emb_entry.as_slice()[..*dim]);
 
-                                    index_miss_count += 1;
-                                } else {
-                                    embeddings.extend_from_slice(vec![0f32; *dim].as_slice());
-                                }
+                                index_miss_count += 1;
+                                unsafe { std::ptr::copy::<f32>( emb_entry.as_ptr(), value.as_mut_ptr(), *dim + require_space) }
+                                let upsert_status = self.store.upsert(*sign, value.as_mut_ptr() as *mut u8,
+                                    (std::mem::size_of::<f32>() * (*dim + require_space)) as u64);
+                            } else {
+                                embeddings.extend_from_slice(vec![0f32; *dim].as_slice());
                             }
-                            Some(entry) => {
-                                let entry_dim = entry.dim();
-                                if entry_dim != *dim {
-                                    tracing::error!("dimension not match on sign {}. Expected dimension {}, got dimension {}.", sign, entry_dim, dim);
-                                    let entry = HashMapEmbeddingEntry::new(
-                                        &conf.initialization_method,
-                                        *dim,
-                                        optimizer.require_space(*dim),
-                                        *sign,
-                                        *sign,
-                                    );
-                                    embeddings.extend_from_slice(entry.emb());
-                                    let _ = shard.insert(*sign, entry);
-                                } else {
-                                    embeddings.extend_from_slice(entry.emb());
-                                }
-                            }
+                            drop(value);
+                        } else if read_status == mlkv_rust::faster_status::FasterStatus::OK as u8 {
+                            embeddings.extend_from_slice(&std::mem::ManuallyDrop::into_inner(value)[..*dim]);
+                        } else if read_status == mlkv_rust::faster_status::FasterStatus::Pending as u8 {
+                            self.store.complete_pending(true);
+                            embeddings.extend_from_slice(&std::mem::ManuallyDrop::into_inner(value)[..*dim]);
                         }
                     });
-                Ok(())
-            }
-            false => {
-                req.iter().for_each(|(sign, dim)| {
-                    let shard = self.embedding.shard(sign).read();
-                    match shard.get(sign) {
-                        Some(entry) => {
-                            let entry_dim = entry.dim();
-                            if entry_dim != *dim {
-                                tracing::error!("dimension not match on sign {}. Expected dimension {}, got dimension {}.",
-                                    sign, entry_dim, dim);
-                                embeddings.extend_from_slice(vec![0f32; *dim].as_slice());
-                            } else {
-                                embeddings.extend_from_slice(entry.emb());
-                            }
-                        }
-                        None => {
+                    self.store.stop_session();
+                    Ok(())
+                }
+                false => {
+                    self.store.start_session();
+                    req.iter().for_each(|(sign, dim)| {
+                        let value = vec![0 as f32; *dim + optimizer.require_space(*dim)];
+                        let mut value = std::mem::ManuallyDrop::new(value);
+                        let read_status = self.store.read(*sign, value.as_mut_ptr() as *mut u8);
+                        if read_status == mlkv_rust::faster_status::FasterStatus::OK as u8 {
+                            embeddings.extend_from_slice(&std::mem::ManuallyDrop::into_inner(value)[..*dim]);
+                        } else if read_status == mlkv_rust::faster_status::FasterStatus::Pending as u8 {
+                            self.store.complete_pending(true);
+                            embeddings.extend_from_slice(&std::mem::ManuallyDrop::into_inner(value)[..*dim]);
+                        } else if read_status == mlkv_rust::faster_status::FasterStatus::NotFound as u8 {
                             embeddings.extend_from_slice(vec![0f32; *dim].as_slice());
                             index_miss_count += 1;
-                        },
-                    }
-                });
-                Ok(())
+                            drop(value);
+                        }
+                    });
+                    self.store.stop_session();
+                    Ok(())
+                }
             }
         })?;
 
@@ -286,17 +316,10 @@ impl EmbeddingParameterServiceInner {
 
     pub async fn set_embedding(
         &self,
-        embeddings: Vec<HashMapEmbeddingEntry>,
     ) -> Result<(), EmbeddingParameterServerError> {
         let start_time = std::time::Instant::now();
 
-        tokio::task::block_in_place(|| {
-            embeddings.into_iter().for_each(|entry| {
-                let id = entry.sign();
-                let mut shard = self.embedding.shard(&id).write();
-                let _ = shard.insert(id, entry);
-            });
-        });
+        tracing::error!("Not implemented");
 
         if let Ok(m) = MetricsHolder::get() {
             m.set_embedding_time_cost_sec
@@ -358,10 +381,10 @@ impl EmbeddingParameterServiceInner {
 
     pub async fn update_gradient_mixed(
         &self,
-        req: (Vec<u64>, Vec<f32>),
+        req: (Vec<u64>, Vec<f32>, Vec<usize>),
     ) -> Result<(), EmbeddingParameterServerError> {
         let conf = self.get_configuration().await?;
-        let (signs, remaining_gradients) = req;
+        let (signs, remaining_gradients, dims) = req;
         let mut remaining_gradients = remaining_gradients.as_slice();
         let mut indices_to_commit = Vec::with_capacity(signs.len());
         let mut gradient_id_miss_count = 0;
@@ -375,33 +398,44 @@ impl EmbeddingParameterServiceInner {
         let batch_level_state = optimizer.get_batch_level_state(signs.as_slice());
 
         tokio::task::block_in_place(|| {
+            self.store.start_session();
             for (idx, sign) in signs.iter().enumerate() {
-                let mut shard = self.embedding.shard(sign).write();
-                if let Some(entry) = shard.get_mut(sign) {
-                    let entry_dim = entry.dim();
+                let entry_dim = dims[idx];
+                let require_space = optimizer.require_space(entry_dim);
+                let value = vec![0 as f32; entry_dim + require_space];
+                let mut value = std::mem::ManuallyDrop::new(value);
+                let read_status = self.store.read(*sign, value.as_mut_ptr() as *mut u8);
+                self.store.complete_pending(true);
+
+                if read_status == mlkv_rust::faster_status::FasterStatus::OK as u8
+                    || read_status == mlkv_rust::faster_status::FasterStatus::Pending as u8 {
                     let (grad, r) = remaining_gradients.split_at(entry_dim);
                     remaining_gradients = r;
+                    let emb_entry_slice = value.as_mut_slice();
                     let emb_opt_state = optimizer.get_emb_state(&batch_level_state, idx);
+                    optimizer.update(emb_entry_slice, grad, entry_dim, &emb_opt_state);
 
-                    {
-                        let emb_entry_slice = entry.as_mut_emb_entry_slice();
-                        optimizer.update(emb_entry_slice, grad, entry_dim, &emb_opt_state);
-
-                        if conf.enable_weight_bound {
-                            unsafe {
-                                persia_simd::weight_bound(
-                                    &mut emb_entry_slice[..entry_dim],
-                                    conf.weight_bound,
-                                );
-                            }
+                    if conf.enable_weight_bound {
+                        unsafe {
+                            persia_simd::weight_bound(
+                                &mut emb_entry_slice[..entry_dim],
+                                conf.weight_bound,
+                            );
                         }
                     }
 
                     indices_to_commit.push(*sign);
+
+                    //let upsert_status = self.store.upsert(*sign, value.as_mut_ptr() as *mut u8,
+                    //    (std::mem::size_of::<f32>() * (entry_dim + require_space)) as u64);
+                    let upsert_status = self.store.mlkv_upsert(*sign, value.as_mut_ptr() as *mut u8,
+                        (std::mem::size_of::<f32>() * (entry_dim + require_space)) as u64);
                 } else {
                     gradient_id_miss_count += 1;
                 }
+                drop(value);
             }
+            self.store.stop_session();
         });
 
         tracing::debug!(
@@ -452,16 +486,14 @@ impl EmbeddingParameterServiceInner {
 
     pub async fn dump(&self, dir: String) -> Result<(), EmbeddingParameterServerError> {
         let dst_dir = PathBuf::from(dir);
-        self.embedding_model_manager
-            .dump_embedding(dst_dir, self.embedding.clone())?;
+        tracing::error!("Not implemented");
         Ok(())
     }
 
     pub async fn load(&self, dir: String) -> Result<(), EmbeddingParameterServerError> {
         let dst_dir = PathBuf::from(dir);
         let shard_dir = self.embedding_model_manager.get_shard_dir(&dst_dir);
-        self.embedding_model_manager
-            .load_embedding_from_dir(shard_dir, self.embedding.clone())?;
+        tracing::error!("Not implemented");
         Ok(())
     }
 
@@ -480,11 +512,13 @@ impl EmbeddingParameterServiceInner {
     }
 
     pub async fn get_embedding_size(&self) -> Result<usize, EmbeddingParameterServerError> {
-        Ok(self.embedding.num_total_signs())
+        tracing::error!("Not implemented");
+        Ok(0)
     }
 
     pub async fn clear_embeddings(&self) -> Result<(), EmbeddingParameterServerError> {
-        Ok(self.embedding.clear())
+        tracing::error!("Not implemented");
+        Ok(())
     }
 }
 
@@ -507,9 +541,9 @@ impl EmbeddingParameterService {
 
     pub async fn set_embedding(
         &self,
-        req: Vec<HashMapEmbeddingEntry>,
+        req: (),
     ) -> Result<(), EmbeddingParameterServerError> {
-        self.inner.set_embedding(req).await
+        self.inner.set_embedding().await
     }
 
     pub async fn lookup_inference(
@@ -532,7 +566,7 @@ impl EmbeddingParameterService {
 
     pub async fn update_gradient_mixed(
         &self,
-        req: (Vec<u64>, Vec<f32>),
+        req: (Vec<u64>, Vec<f32>, Vec<usize>),
     ) -> Result<(), EmbeddingParameterServerError> {
         self.inner.update_gradient_mixed(req).await
     }

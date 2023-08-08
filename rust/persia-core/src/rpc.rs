@@ -4,11 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use persia_libs::{
-    anyhow::Result, futures, indexmap::IndexMap, itertools::Itertools, parking_lot::RwLock, rand,
-    tracing,
+    anyhow::Result, futures, indexmap::IndexMap, parking_lot::RwLock, rand, tracing,
 };
 
-use persia_embedding_holder::emb_entry::HashMapEmbeddingEntry;
 use persia_embedding_server::embedding_worker_service::EmbeddingWorkerClient;
 use persia_model_manager::EmbeddingModelManagerStatus;
 
@@ -76,24 +74,14 @@ impl PersiaRpcClient {
 
     pub async fn set_embedding(
         &self,
-        entries: Vec<HashMapEmbeddingEntry>,
     ) -> Result<(), PersiaError> {
         let num_embedding_workers = self.clients.read().len();
-        let num_entries = entries.len();
 
-        let grouped_entries: Vec<Vec<HashMapEmbeddingEntry>> = entries
+        let futs = (0..num_embedding_workers)
             .into_iter()
-            .chunks(num_entries / num_embedding_workers)
-            .into_iter()
-            .map(|chunk| chunk.collect())
-            .collect();
-
-        let futs = grouped_entries
-            .into_iter()
-            .enumerate()
-            .map(|(client_index, entries)| {
+            .map(|client_index| {
                 let client = self.get_client_by_index(client_index);
-                async move { client.set_embedding(&entries).await }
+                async move { client.set_embedding(&()).await }
             });
 
         let results = futures::future::try_join_all(futs).await?;

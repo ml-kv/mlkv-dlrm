@@ -16,7 +16,7 @@ use persia_libs::{
     bytes, futures,
     hashbrown::HashMap,
     hyper,
-    itertools::Itertools,
+    itertools::{Itertools, izip},
     lz4, ndarray, once_cell,
     smol::block_on,
     thiserror, tokio, tracing,
@@ -28,13 +28,12 @@ use persia_common::{
     ndarray_f16_to_f32, ndarray_f32_to_f16,
     optim::OptimizerConfig,
     EmbeddingBatch, FeatureEmbeddingBatch, FeatureRawEmbeddingBatch, FeatureSumEmbeddingBatch,
-    IDTypeFeatureBatch, IDTypeFeatureRemoteRef, SingleSignInFeatureBatch,
+    IDTypeFeatureBatch, IDTypeFeatureRemoteRef,
 };
 use persia_embedding_config::{
     EmbeddingConfig, EmbeddingWorkerConfig, InstanceInfo, PersiaCommonConfig,
     PersiaEmbeddingModelHyperparameters, PersiaGlobalConfigError, PersiaReplicaInfo, SlotConfig,
 };
-use persia_embedding_holder::emb_entry::HashMapEmbeddingEntry;
 use persia_metrics::{
     Gauge, GaugeVec, IntCounterVec, PersiaMetricsManager, PersiaMetricsManagerError,
 };
@@ -648,8 +647,8 @@ impl EmbeddingWorkerInner {
             .collect();
 
         let mut sharded_gradients = vec![vec![]; self.all_embedding_server_client.replica_size()];
-        let mut sharded_gradient_signs =
-            vec![vec![]; self.all_embedding_server_client.replica_size()];
+        let mut sharded_gradient_signs = vec![vec![]; self.all_embedding_server_client.replica_size()];
+        let mut sharded_gradient_dims = vec![vec![]; self.all_embedding_server_client.replica_size()];
 
         for gradient in embedding_gradient_batch.gradients.iter_mut() {
             match gradient {
@@ -744,6 +743,7 @@ impl EmbeddingWorkerInner {
                             sharded_gradients[replica_index as usize]
                                 .extend_from_slice(grad.as_slice().unwrap());
                             sharded_gradient_signs[replica_index as usize].push(sign.sign);
+                            sharded_gradient_dims[replica_index as usize].push(slot_conf.dim);
                         }
                     });
                 }
@@ -758,11 +758,9 @@ impl EmbeddingWorkerInner {
             }
         }
 
-        let futs = sharded_gradients
-            .into_iter()
-            .zip(sharded_gradient_signs)
+        let futs = izip!(sharded_gradients, sharded_gradient_signs, sharded_gradient_dims)
             .enumerate()
-            .map(|(replica_index, (grads, signs))| {
+            .map(|(replica_index, (grads, signs, dims))| {
                 let client = block_on(
                     self.all_embedding_server_client
                         .get_client_by_index(replica_index),
@@ -770,7 +768,7 @@ impl EmbeddingWorkerInner {
                 async move {
                     let start_time = Instant::now();
                     client
-                        .update_gradient_mixed(&(signs, grads))
+                        .update_gradient_mixed(&(signs, grads, dims))
                         .await
                         .map_err(|e| EmbeddingWorkerError::RpcError(format!("{:?}", e)))??;
                     let result = Ok::<_, EmbeddingWorkerError>(());
@@ -884,26 +882,20 @@ impl EmbeddingWorkerInner {
 
     pub async fn set_embedding(
         &self,
-        req: Vec<HashMapEmbeddingEntry>,
+        req: (),
     ) -> Result<(), EmbeddingWorkerError> {
         let replica_size = self.replica_size;
         let futs: Vec<_> = tokio::task::block_in_place(|| {
-            let grouped_entries = req
+            (0..replica_size)
                 .into_iter()
-                .sorted_by_key(|e| sign_to_replica_modulo(e.sign(), replica_size))
-                .group_by(|e| sign_to_replica_modulo(e.sign(), replica_size));
-
-            grouped_entries
-                .into_iter()
-                .map(|(replica_index, requests)| {
-                    let group = requests.into_iter().collect_vec();
+                .map(|replica_index| {
                     let client = block_on(
                         self.all_embedding_server_client
                             .get_client_by_index(replica_index as usize),
                     );
                     async move {
                         client
-                            .set_embedding(&group)
+                            .set_embedding(&())
                             .await
                             .map_err(|e| EmbeddingWorkerError::RpcError(format!("{:?}", e)))??;
                         Ok::<_, EmbeddingWorkerError>(())
@@ -1164,11 +1156,8 @@ impl EmbeddingWorkerInner {
                 let loaded = loaded.clone();
                 async move {
                     for file_path in file_list.into_iter() {
-                        let array_linked_list = tokio::task::block_in_place(|| {
-                            embedding_model_manager.load_array_linked_list(file_path)
-                        })?;
-                        let entries = Vec::from_iter(array_linked_list.into_iter());
-                        embedding_worker_inner.set_embedding(entries).await?;
+                        tracing::error!("Not implemented!");
+                        embedding_worker_inner.set_embedding(()).await?;
                         let cur_loaded = loaded.fetch_add(1, Ordering::AcqRel) + 1;
                         let progress = (cur_loaded as f32 / num_files as f32) * 100.0_f32;
                         tracing::info!(
@@ -1314,7 +1303,7 @@ impl EmbeddingWorker {
 
     pub async fn set_embedding(
         &self,
-        req: Vec<HashMapEmbeddingEntry>,
+        req: (),
     ) -> Result<(), EmbeddingWorkerError> {
         self.inner.set_embedding(req).await
     }
