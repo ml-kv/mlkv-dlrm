@@ -248,7 +248,7 @@ impl EmbeddingParameterServiceInner {
                             } else {
                                 embeddings.extend_from_slice(vec![0f32; *dim].as_slice());
                             }
-                            drop(value);
+                            std::mem::ManuallyDrop::into_inner(value);
                         } else if read_status == mlkv_rust::faster_status::FasterStatus::OK as u8 {
                             embeddings.extend_from_slice(&std::mem::ManuallyDrop::into_inner(value)[..*dim]);
                         } else if read_status == mlkv_rust::faster_status::FasterStatus::Pending as u8 {
@@ -273,7 +273,7 @@ impl EmbeddingParameterServiceInner {
                         } else if read_status == mlkv_rust::faster_status::FasterStatus::NotFound as u8 {
                             embeddings.extend_from_slice(vec![0f32; *dim].as_slice());
                             index_miss_count += 1;
-                            drop(value);
+                            std::mem::ManuallyDrop::into_inner(value);
                         }
                     });
                     self.store.stop_session();
@@ -433,7 +433,7 @@ impl EmbeddingParameterServiceInner {
                 } else {
                     gradient_id_miss_count += 1;
                 }
-                drop(value);
+                std::mem::ManuallyDrop::into_inner(value);
             }
             self.store.stop_session();
         });
