@@ -229,6 +229,7 @@ impl EmbeddingParameterServiceInner {
                         //let read_status = self.store.mlkv_lookahead(*sign, value.as_mut_ptr() as *mut u8,
                         let read_status = self.store.mlkv_read(*sign, value.as_mut_ptr() as *mut u8,
                            (std::mem::size_of::<f32>() * (*dim + require_space)) as u64);
+                        self.store.complete_pending(true);
                         if read_status == mlkv_rust::faster_status::FasterStatus::NotFound as u8 {
                             if rand::thread_rng().gen_range(0f32..1f32) < conf.admit_probability {
                                 let mut emb_entry = Self::init_embedding_entry(
@@ -252,7 +253,6 @@ impl EmbeddingParameterServiceInner {
                         } else if read_status == mlkv_rust::faster_status::FasterStatus::OK as u8 {
                             embeddings.extend_from_slice(&std::mem::ManuallyDrop::into_inner(value)[..*dim]);
                         } else if read_status == mlkv_rust::faster_status::FasterStatus::Pending as u8 {
-                            self.store.complete_pending(true);
                             embeddings.extend_from_slice(&std::mem::ManuallyDrop::into_inner(value)[..*dim]);
                         }
                     });
