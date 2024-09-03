@@ -1,0 +1,22 @@
+sample_num: 189747893
+distingct_ids: 882774559
+sparses_dim: 16
+sparses_field: 26
+dense_dim:  13
+batch_size: 1024
+dense_lr: 0.001
+sparse_lr: 0.0005
+epoch_num: 1
+ln: [4096, 2048, 1024, 512, 256]
+forward_buffer_size: 10000
+embedding_staleness: 4
+dense_optimizer: Adam
+sparse_optimizer: Adam
+loss_function: "cse"
+weight_bound: 0
+dataset_type: "npz"
+log_interval: 16
+label_num: 2
+test_interval: 10000
+train_data_dir: data/train.npz
+test_data_dir: data/test.npz
