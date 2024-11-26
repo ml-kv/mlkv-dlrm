@@ -1,0 +1,81 @@
+feature_index_prefix_bit: 12
+slots_config:
+  C1:
+    dim: 16
+    embedding_summation: true
+  C2:
+    dim: 16
+    embedding_summation: true
+  C3:
+    dim: 16
+    embedding_summation: true    
+  C4:
+    dim: 16
+    embedding_summation: true
+  C5:
+    dim: 16
+    embedding_summation: true
+  C6:
+    dim: 16
+    embedding_summation: true
+  C7:
+    dim: 16
+    embedding_summation: true
+  C8:
+    dim: 16
+    embedding_summation: true
+  C9:
+    dim: 16
+    embedding_summation: true
+  C10:
+    dim: 16
+    embedding_summation: true
+  C11:
+    dim: 16
+    embedding_summation: true
+  C12:
+    dim: 16
+    embedding_summation: true
+  C13:
+    dim: 16
+    embedding_summation: true
+  C14:
+    dim: 16
+    embedding_summation: true
+  C15:
+    dim: 16
+    embedding_summation: true
+  C16:
+    dim: 16
+    embedding_summation: true
+  C17:
+    dim: 16
+    embedding_summation: true
+  C18:
+    dim: 16
+    embedding_summation: true
+  C19:
+    dim: 16
+    embedding_summation: true
+  C20:
+    dim: 16
+    embedding_summation: true
+  C21:
+    dim: 16
+    embedding_summation: true
+  C22:
+    dim: 16
+    embedding_summation: true
+  C23:
+    dim: 16
+    embedding_summation: true
+  C24:
+    dim: 16
+    embedding_summation: true
+  C25:
+    dim: 16
+    embedding_summation: true
+  C26:
+    dim: 16
+    embedding_summation: true
+feature_groups: {}
