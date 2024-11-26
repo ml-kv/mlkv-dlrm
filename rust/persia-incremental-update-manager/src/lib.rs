@@ -20,23 +20,18 @@ use persia_embedding_config::{
     EmbeddingParameterServerConfig, PerisaJobType, PersiaCommonConfig, PersiaGlobalConfigError,
     PersiaReplicaInfo,
 };
-use persia_embedding_holder::{
-    emb_entry::HashMapEmbeddingEntry, PersiaEmbeddingHolder, PersiaEmbeddingHolderError,
-};
 use persia_metrics::{Gauge, PersiaMetricsManager, PersiaMetricsManagerError};
 use persia_speedy::{Readable, Writable};
 use persia_storage::{PersiaPath, PersiaPathImpl};
 
 #[derive(Readable, Writable, Debug)]
 pub struct PerisaIncrementalPacket {
-    pub content: Vec<HashMapEmbeddingEntry>,
+    pub content: Vec<(u64, Vec<f32>)>,
     pub timestamps: u64,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum IncrementalUpdateError {
-    #[error("embedding holder error: {0}")]
-    PersiaEmbeddingHolderError(#[from] PersiaEmbeddingHolderError),
     #[error("global config error: {0}")]
     PersiaGlobalConfigError(#[from] PersiaGlobalConfigError),
     #[error("embedding holder not found error")]
@@ -77,7 +72,6 @@ static INCREMENTAL_UPDATE_MANAGER: OnceCell<Arc<PerisaIncrementalUpdateManager>>
 const INCREMENTAL_UPDATE_CHANNEL_CAPACITY: usize = 1000;
 
 pub struct PerisaIncrementalUpdateManager {
-    embedding_holder: PersiaEmbeddingHolder,
     executors: Arc<ThreadPool>,
     replica_index: usize,
     incremental_buffer_size: usize,
@@ -91,11 +85,9 @@ impl PerisaIncrementalUpdateManager {
         let singleton = INCREMENTAL_UPDATE_MANAGER.get_or_try_init(|| {
             let server_config = EmbeddingParameterServerConfig::get()?;
             let common_config = PersiaCommonConfig::get()?;
-            let embedding_holder = PersiaEmbeddingHolder::get()?;
             let replica_info = PersiaReplicaInfo::get()?;
 
             let singleton = Self::new(
-                embedding_holder,
                 common_config.job_type.clone(),
                 common_config.checkpointing_config.num_workers,
                 replica_info.replica_index,
@@ -112,7 +104,6 @@ impl PerisaIncrementalUpdateManager {
     }
 
     fn new(
-        embedding_holder: PersiaEmbeddingHolder,
         cur_task: PerisaJobType,
         num_executors: usize,
         replica_index: usize,
@@ -136,7 +127,6 @@ impl PerisaIncrementalUpdateManager {
             .collect();
 
         let instance = Arc::new(Self {
-            embedding_holder,
             executors,
             replica_index,
             incremental_buffer_size,
@@ -183,13 +173,10 @@ impl PerisaIncrementalUpdateManager {
         num_dumped_signs: Arc<AtomicUsize>,
         num_total_signs: usize,
     ) -> () {
+        tracing::error!("Not implemented!");
+
         let mut entries = Vec::with_capacity(signs.len());
-        signs.iter().for_each(|sign| {
-            let shard = self.embedding_holder.shard(sign).read();
-            if let Some(entry) = shard.get(sign) {
-                entries.push(entry.clone());
-            }
-        });
+        signs.iter().for_each(|sign| {});
 
         let segment_len = entries.len();
         let file_name = PathBuf::from(format!("{}_{}.inc", self.replica_index, file_index));
@@ -229,11 +216,9 @@ impl PerisaIncrementalUpdateManager {
             m.inc_update_delay_sec.set(delay as f64);
         }
         tracing::debug!("loading inc packet, delay is {}s", delay);
-        packet.content.into_iter().for_each(|entry| {
-            let sign = entry.sign();
-            let mut shard = self.embedding_holder.shard(&sign).write();
-            shard.insert(sign, entry);
+        packet.content.into_iter().for_each(|(sign, entry)| {
         });
+        tracing::error!("Not implemented!");
     }
 
     pub fn try_commit_incremental(

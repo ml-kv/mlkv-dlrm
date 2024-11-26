@@ -303,13 +303,6 @@ fn get_default_infer_config() -> InferConfig {
     InferConfig::default()
 }
 
-fn get_default_hashstack_config() -> HashStackConfig {
-    HashStackConfig {
-        hash_stack_rounds: 0,
-        embedding_size: 0,
-    }
-}
-
 fn get_default_feature_groups() -> indexmap::IndexMap<String, Vec<String>> {
     indexmap::IndexMap::new()
 }
@@ -527,13 +520,6 @@ impl PersiaGlobalConfig {
 
 #[derive(Deserialize, Serialize, Readable, Writable, Debug, Clone)]
 #[serde(crate = "self::serde")]
-pub struct HashStackConfig {
-    pub hash_stack_rounds: usize,
-    pub embedding_size: usize,
-}
-
-#[derive(Deserialize, Serialize, Readable, Writable, Debug, Clone)]
-#[serde(crate = "self::serde")]
 pub struct SlotConfig {
     pub dim: usize,
     #[serde(default = "get_ten")]
@@ -542,8 +528,6 @@ pub struct SlotConfig {
     pub embedding_summation: bool,
     #[serde(default = "get_false")]
     pub sqrt_scaling: bool,
-    #[serde(default = "get_default_hashstack_config")]
-    pub hash_stack_config: HashStackConfig,
     // index_prefix: different prefix add to index of different features, to prevent bucket conflict for each feature embedding.
     #[serde(default = "get_zero")]
     pub index_prefix: u64,

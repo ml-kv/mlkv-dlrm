@@ -16,10 +16,6 @@ use persia_libs::{
 };
 
 use persia_embedding_config::{PersiaCommonConfig, PersiaGlobalConfigError, PersiaReplicaInfo};
-use persia_embedding_holder::{
-    array_linked_list::ArrayLinkedList, emb_entry::HashMapEmbeddingEntry, PersiaEmbeddingHolder,
-    PersiaEmbeddingHolderError,
-};
 use persia_speedy::{Readable, Writable};
 use persia_storage::{PersiaPath, PersiaPathImpl};
 
@@ -27,8 +23,6 @@ use persia_storage::{PersiaPath, PersiaPathImpl};
 pub enum EmbeddingModelManagerError {
     #[error("storage error {0}")]
     StorageError(String),
-    #[error("embedding holder error: {0}")]
-    PersiaEmbeddingHolderError(#[from] PersiaEmbeddingHolderError),
     #[error("global config error: {0}")]
     PersiaGlobalConfigError(#[from] PersiaGlobalConfigError),
     #[error("wait for other server time out when dump embedding")]
@@ -239,109 +233,6 @@ impl EmbeddingModelManager {
         Ok(())
     }
 
-    pub fn dump_internal_shard_embeddings(
-        &self,
-        internal_shard_idx: usize,
-        dst_dir: PathBuf,
-        embedding_holder: PersiaEmbeddingHolder,
-    ) -> Result<(), EmbeddingModelManagerError> {
-        let shard = embedding_holder
-            .get_shard_by_index(internal_shard_idx)
-            .read();
-
-        let file_name = self.get_internam_shard_filename(internal_shard_idx);
-        let emb_path = PersiaPath::from_vec(vec![&dst_dir, &file_name]);
-
-        emb_path.write_all_speedy(&shard.linkedlist)?;
-
-        Ok(())
-    }
-
-    pub fn load_internal_shard_embeddings(
-        &self,
-        file_path: PathBuf,
-        embedding_holder: PersiaEmbeddingHolder,
-    ) -> Result<(), EmbeddingModelManagerError> {
-        let decoded = self.load_array_linked_list(file_path)?;
-
-        decoded.into_iter().for_each(|entry| {
-            let sign = entry.sign();
-            let mut shard = embedding_holder.shard(&sign).write();
-            shard.insert(sign, entry);
-        });
-
-        Ok(())
-    }
-
-    pub fn load_array_linked_list(
-        &self,
-        file_path: PathBuf,
-    ) -> Result<ArrayLinkedList<HashMapEmbeddingEntry>, EmbeddingModelManagerError> {
-        tracing::debug!("loading embedding linked list from {:?}", file_path);
-        let emb_path = PersiaPath::from_pathbuf(file_path);
-        let decoded: ArrayLinkedList<HashMapEmbeddingEntry> = emb_path.read_to_end_speedy()?;
-        Ok(decoded)
-    }
-
-    pub fn dump_embedding(
-        &self,
-        dst_dir: PathBuf,
-        embedding_holder: PersiaEmbeddingHolder,
-    ) -> Result<(), EmbeddingModelManagerError> {
-        *self.status.write() = EmbeddingModelManagerStatus::Dumping(0.0);
-        tracing::info!("start to dump embedding to {:?}", dst_dir);
-
-        let shard_dir = self.get_shard_dir(&dst_dir);
-        let num_internal_shards = embedding_holder.num_internal_shards();
-        let num_dumped_shards = Arc::new(AtomicUsize::new(0));
-        let manager = Self::get()?;
-
-        (0..num_internal_shards).for_each(|internal_shard_idx| {
-            let dst_dir = shard_dir.clone();
-            let num_dumped_shards = num_dumped_shards.clone();
-            let manager = manager.clone();
-            let embedding_holder = embedding_holder.clone();
-
-            self.thread_pool.spawn(move || {
-                let closure = || -> Result<(), EmbeddingModelManagerError> {
-                    manager.dump_internal_shard_embeddings(
-                        internal_shard_idx,
-                        dst_dir.clone(),
-                        embedding_holder,
-                    )?;
-
-                    let dumped = num_dumped_shards.fetch_add(1, Ordering::AcqRel) + 1;
-                    let dumping_progress = (dumped as f32) / (num_internal_shards as f32);
-
-                    *manager.status.write() =
-                        EmbeddingModelManagerStatus::Dumping(dumping_progress);
-                    tracing::debug!("dumping progress is {}", dumping_progress);
-
-                    if dumped >= num_internal_shards {
-                        manager.mark_embedding_dump_done(dst_dir.clone(), num_internal_shards)?;
-                        if manager.is_master_server() {
-                            let parent_dir = manager.get_parent_dir(&dst_dir);
-                            manager
-                                .waiting_for_all_embedding_server_dump(600, parent_dir.clone())?;
-                            manager.mark_embedding_dump_done(parent_dir, num_internal_shards)?;
-                        }
-
-                        tracing::info!("dump embedding to {:?} compelete", dst_dir);
-                        *manager.status.write() = EmbeddingModelManagerStatus::Idle;
-                    }
-
-                    Ok(())
-                };
-
-                if let Err(e) = closure() {
-                    *manager.status.write() = EmbeddingModelManagerStatus::Failed(e);
-                }
-            })
-        });
-
-        Ok(())
-    }
-
     pub fn get_emb_file_list_in_dir(
         &self,
         dir: PathBuf,
@@ -370,57 +261,5 @@ impl EmbeddingModelManager {
         }
 
         Ok(file_list)
-    }
-
-    pub fn load_embedding_from_dir(
-        &self,
-        dir: PathBuf,
-        embedding_holder: PersiaEmbeddingHolder,
-    ) -> Result<(), EmbeddingModelManagerError> {
-        tracing::info!("start to load embedding from dir {:?}", dir);
-
-        let file_list = self.get_emb_file_list_in_dir(dir)?;
-
-        let num_total_files = file_list.len();
-        let num_loaded_files = Arc::new(AtomicUsize::new(0));
-
-        for file_path in file_list.into_iter() {
-            tracing::debug!("spawn to load embedding from {:?}", file_path);
-            let manager = Self::get()?;
-
-            self.thread_pool.spawn({
-                let manager = manager.clone();
-                let num_loaded_files = num_loaded_files.clone();
-                let embedding_holder = embedding_holder.clone();
-                move || {
-                    let closure = || -> Result<(), EmbeddingModelManagerError> {
-                        tracing::debug!("start to execute load embedding from {:?}", file_path);
-                        manager
-                            .load_internal_shard_embeddings(file_path.clone(), embedding_holder)?;
-
-                        let loaded = num_loaded_files.fetch_add(1, Ordering::AcqRel) + 1;
-                        let loading_progress = (loaded as f32) / (num_total_files as f32);
-                        *manager.status.write() =
-                            EmbeddingModelManagerStatus::Loading(loading_progress);
-                        tracing::debug!("load embedding progress is {}", loading_progress);
-
-                        if num_total_files == loaded {
-                            *manager.status.write() = EmbeddingModelManagerStatus::Idle;
-                            let parent = manager.get_parent_dir(&file_path);
-                            tracing::info!("load checkpoint from {:?} compelete", parent);
-                        }
-
-                        Ok(())
-                    };
-
-                    if let Err(e) = closure() {
-                        *manager.status.write() = EmbeddingModelManagerStatus::Failed(e);
-                    }
-                }
-            });
-        }
-        *self.status.write() = EmbeddingModelManagerStatus::Loading(0.0);
-
-        Ok(())
     }
 }
